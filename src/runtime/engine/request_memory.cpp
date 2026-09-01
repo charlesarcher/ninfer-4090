@@ -19,10 +19,14 @@ bool is_power_of_two(std::size_t value) noexcept {
 
 class RequestMemory::Impl {
 public:
-    Impl(DeviceContext& context, std::size_t capacity) : device(context.device) {
+    Impl(DeviceContext& context, std::size_t capacity, bool kv_managed) : device(context.device) {
         if (capacity != 0) {
             CUDA_CHECK(cudaSetDevice(device));
-            arena = std::make_unique<DeviceArena>(capacity);
+            if (kv_managed) {
+                arena = std::make_unique<ManagedDeviceArena>(capacity);
+            } else {
+                arena = std::make_unique<DeviceArena>(capacity);
+            }
         }
     }
 
@@ -40,8 +44,9 @@ public:
     std::size_t peak_bytes       = 0;
 };
 
-RequestMemory::RequestMemory(DeviceContext& device, std::size_t frozen_capacity_bytes)
-    : impl_(std::make_unique<Impl>(device, frozen_capacity_bytes)) {}
+RequestMemory::RequestMemory(DeviceContext& device, std::size_t frozen_capacity_bytes,
+                               bool kv_managed)
+    : impl_(std::make_unique<Impl>(device, frozen_capacity_bytes, kv_managed)) {}
 
 RequestMemory::~RequestMemory() = default;
 

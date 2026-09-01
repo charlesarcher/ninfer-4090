@@ -383,9 +383,28 @@ int test_reject_unsupported() {
 
     Json rf               = base;
     rf["response_format"] = Json{{"type", "json_object"}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
+    bool rf_obj_ok        = true;
+    try {
+        (void)parse_chat_completion_request(rf, default_limits());
+    } catch (...) { rf_obj_ok = false; }
+    failures += check(rf_obj_ok, "json_object response_format accepted (soft hint)");
+
+    Json rf_schema               = base;
+    rf_schema["response_format"] = Json{{"type", "json_schema"},
+                                        {"json_schema",
+                                         Json{{"name", "t"}, {"strict", true},
+                                              {"schema", Json{{"type", "object"}}}}}};
+    bool rf_schema_ok = true;
+    try {
+        (void)parse_chat_completion_request(rf_schema, default_limits());
+    } catch (...) { rf_schema_ok = false; }
+    failures += check(rf_schema_ok, "json_schema response_format accepted (soft hint)");
+
+    Json rf_unknown              = base;
+    rf_unknown["response_format"] = Json{{"type", "csv"}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(rf_unknown, default_limits()); }),
+        "unknown response_format type rejected");
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};

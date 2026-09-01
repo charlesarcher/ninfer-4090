@@ -464,9 +464,16 @@ void reject_unsupported_features(const Json& body) {
         std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
                                ? fmt.at("type").get<std::string>()
                                : std::string();
-        if (type != "text") {
+        // `text` is exact; `json_object` / `json_schema` are accepted as a soft
+        // hint (no grammar decoder): the engine samples normally and the
+        // client-side prompt contract constrains the shape. The chat-tuned
+        // frontend models honor JSON constraints from the prompt, so clients
+        // that send a structured response_format (e.g. Hermes auto-titles with
+        // json_schema, or tool-call scaffolding) get compliant output instead
+        // of a 400. Unknown types are still rejected.
+        if (type != "text" && type != "json_object" && type != "json_schema") {
             ApiError error;
-            error.message = "only response_format {type:text} is supported";
+            error.message = "only response_format {type:text|json_object|json_schema} is supported";
             error.param   = "response_format";
             error.code    = "response_format_not_supported";
             throw ApiException(std::move(error));

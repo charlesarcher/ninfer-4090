@@ -48,7 +48,7 @@ public:
 
 private:
     friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
-                                            DeviceContext&, LoadProgress*);
+                                            DeviceContext&, LoadProgress*, bool);
 
     struct ObjectStorage {
         void* device = nullptr;
@@ -61,6 +61,7 @@ private:
 };
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 DeviceContext& device, LoadProgress* progress = nullptr);
+                                 DeviceContext& device, LoadProgress* progress = nullptr,
+                                 bool kv_managed = false);
 
 } // namespace ninfer::artifact

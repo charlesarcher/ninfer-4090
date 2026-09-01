@@ -96,6 +96,8 @@ std::string serve_usage_text(const char* argv0) {
            "                              reserving " + headroom_mib + " MiB headroom; default: matches --max-context)\n"
            "  --prefill-chunk <N>         Prefill chunk size in tokens (multiple of 128, default: 1024)\n"
            "  --no-cuda-graph             Disable CUDA Graph capture/replay (executes via standard CUDA streams)\n"
+           "  --no-prefix-reuse           Disable KV prefix cache reuse across requests (prefix reuse enabled by default)\n\n"
+           "  --kv-managed                Allocate KV cache and model state via cudaMallocManaged (Unified Memory) so context can oversubscribe VRAM and page to host RAM (long-context >40K; disables CUDA Graphs)\n"
            "  --no-prefix-reuse           Disable KV prefix cache reuse across requests (prefix reuse enabled by default)\n"
            "  --wddm-evictable-budget     Allow aggressive WDDM memory budgeting against total VRAM on dedicated GPUs (Windows only)\n\n"
            "Persistent Prompt Cache (DirectStorage DMA):\n"
@@ -116,11 +118,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                mtp        - Multi-Token Prediction draft heads\n"
            "                                dflash     - Block-parallel draft model (35B-A3B text-only)\n"
            "  --draft-tokens <N>          Speculative draft tokens per verification round (MTP: 1..15, DFlash: 1..15)\n"
-           "  --lm-head-draft             Draft with the dedicated proposal head instead of the full LM head:\n"
-           "                              a smaller projection over the artifact's draft vocabulary, so each\n"
-           "                              draft step reads far less weight memory. Slightly lower acceptance,\n"
-           "                              markedly faster rounds; verification still uses the full head, so\n"
-           "                              generated text is unchanged (requires --spec)\n\n"
+           "  --lm-head-draft             Reuse base model LM head weights for draft logits projection (requires --spec)\n\n"
            "Vision & Multimodal:\n"
            "  --vision                    Enable image/video vision encoder and load Vision GPU allocations\n"
            "  --vision-max-tokens <N>     Vision scratchpad token capacity (default: 8192)\n\n"
@@ -250,6 +248,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision     = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--kv-managed") {
+            options.kv_managed = true;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--wddm-evictable-budget") {

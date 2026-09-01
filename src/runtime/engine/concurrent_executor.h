@@ -184,13 +184,6 @@ public:
         return Submission(*this, std::move(request));
     }
 
-    // False once the worker loop has torn the executor down (`fail_all`) or shutdown has begun.
-    // Latched failures are permanent, so /health can report the process as unserviceable.
-    [[nodiscard]] bool healthy() const {
-        std::lock_guard lock(queue_mutex_);
-        return !stopping_ && !failed_;
-    }
-
     [[nodiscard]] MemorySummary memory_summary() const {
         std::scoped_lock lock(execution_mutex_);
         MemorySummary out                      = instance_.program->memory_summary();
@@ -526,13 +519,6 @@ private:
 
     void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
 
-    [[nodiscard]] bool any_lane_active_except(std::uint32_t lane) const noexcept {
-        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
-            if (other != lane && slots_[other] != nullptr) { return true; }
-        }
-        return false;
-    }
-
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
         invalidate_lane_plans(lane);
@@ -825,23 +811,7 @@ private:
                 }
             }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
-                // The lane plan was built against an earlier view of the page pool: concurrent
-                // checkpoint restores and snapshot saves can consume pages between planning and
-                // admission. Evicting every free retained lane was not enough, which is a
-                // scheduling shortfall rather than a broken engine, so drop the stale plan
-                // instead of throwing (an escaped exception here fails the whole executor).
-                invalidate_lane_plans(lane);
-                if (!any_lane_active_except(lane)) {
-                    // No other lane holds pages, so waiting cannot free any more: this request
-                    // does not fit the configured KV capacity at all.
-                    return remove_pending_error(
-                        request, std::make_exception_ptr(RequestError(
-                                     RequestErrorKind::ContextLengthExceeded,
-                                     "request reservation exceeds Engine shared KV capacity")));
-                }
-                // Active lanes still hold the pages we need. Leave the request pending and retry
-                // once they drain; its pending deadline bounds the wait.
-                return AdmissionProgress::ControlProgress;
+                throw std::logic_error("retained eviction did not make admission feasible");
             }
         }
 

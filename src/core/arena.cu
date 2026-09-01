@@ -237,15 +237,6 @@ bool try_allocate_d3d12_residency_locked(std::size_t capacity_bytes, void*& out_
         cudaMemset(dev_ptr, 0, capacity_bytes);
     }
 
-    // The final zero-fill above is enqueued on the legacy default stream, which does not order
-    // against non-blocking streams such as DeviceContext::load_stream. Wait for it to land so
-    // stream-ordered weight copies cannot be wiped by the fill (silent all-zero weights).
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-        cudaFree(dev_ptr);
-        cudaDestroyExternalMemory(ext_mem);
-        return false;
-    }
-
     out_ptr = dev_ptr;
     g_d3d12_allocations.push_back(std::move(res));
     return true;
@@ -371,14 +362,6 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
                 free_device(ptr);
                 throw std::runtime_error(cuda_error_message("cudaMemset failed", set_err));
             }
-            // The touch is enqueued on the legacy default stream, which does not order against
-            // non-blocking streams such as DeviceContext::load_stream. Wait for it to land so
-            // stream-ordered weight copies cannot be wiped by the fill.
-            const cudaError_t sync_err = cudaDeviceSynchronize();
-            if (sync_err != cudaSuccess) {
-                free_device(ptr);
-                throw std::runtime_error(cuda_error_message("cudaDeviceSynchronize failed", sync_err));
-            }
         }
 #endif
     }
@@ -479,9 +462,9 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
     void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    const cudaError_t err = cudaHostAlloc(&ptr, size_bytes, cudaHostAllocWriteCombined);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        throw std::runtime_error(cuda_error_message("cudaHostAlloc failed", err));
     }
 
     data_ = ptr;
@@ -511,5 +494,118 @@ PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept
 void* PinnedHostBuffer::data() const noexcept { return data_; }
 
 std::size_t PinnedHostBuffer::size() const noexcept { return size_; }
+
+} // namespace ninfer
+
+namespace ninfer {
+
+// --- ManagedDeviceArena: cudaMallocManaged (Unified Memory) KV/state arena ---------------
+// Mirrors DeviceArena's suballocation API (inherits it) but backs the whole region with unified
+// memory so it can oversubscribe device VRAM and page to host RAM (Windows/WDDM-style residency
+// for the context-scaling buffers). A GPU-preferred-location advise keeps pages resident on the
+// device until VRAM is genuinely full, after which the driver migrates cold pages to host.
+
+ManagedDeviceArena::ManagedDeviceArena(std::size_t capacity_bytes) : DeviceArena() {
+    if (capacity_bytes == 0) {
+        throw std::invalid_argument("ManagedDeviceArena capacity must be nonzero");
+    }
+
+    void* ptr             = nullptr;
+    const cudaError_t err = cudaMallocManaged(&ptr, capacity_bytes, cudaMemAttachGlobal);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaMallocManaged failed", err));
+    }
+
+    // Prefer the GPU as the physical location so hot pages stay resident; the driver still pages
+    // to host when device VRAM is exhausted (the oversubscription we want).
+    int device_id = 0;
+    if (cudaGetDevice(&device_id) == cudaSuccess) {
+        cudaMemLocation loc{};
+        loc.type = cudaMemLocationTypeDevice;
+        loc.id   = device_id;
+        cudaMemAdvise(ptr, capacity_bytes, cudaMemAdviseSetPreferredLocation, loc);
+    }
+    // Eagerly touch to commit/establish the mapping (avoids first-touch faults in hot loops).
+    const cudaError_t memset_err = cudaMemset(ptr, 0, capacity_bytes);
+    if (memset_err != cudaSuccess) {
+        cudaFree(ptr);
+        throw std::runtime_error(cuda_error_message("cudaMemset failed on managed arena", memset_err));
+    }
+
+    base_ = ptr;
+    cap_  = capacity_bytes;
+    off_  = 0;
+}
+
+ManagedDeviceArena::~ManagedDeviceArena() {
+    if (owns_ && base_ != nullptr) {
+        log_cuda_error("cudaFree (managed)", cudaFree(base_));
+        base_ = nullptr;
+    }
+}
+
+ManagedDeviceArena::ManagedDeviceArena(ManagedDeviceArena&& other) noexcept
+    : DeviceArena() {
+    base_ = other.base_;
+    cap_  = other.cap_;
+    off_  = other.off_;
+    peak_ = other.peak_;
+    owns_ = other.owns_;
+    other.base_ = nullptr;
+    other.cap_  = 0;
+    other.off_  = 0;
+    other.peak_ = 0;
+    other.owns_ = true;
+}
+
+ManagedDeviceArena& ManagedDeviceArena::operator=(ManagedDeviceArena&& other) noexcept {
+    if (this == &other) { return *this; }
+    if (owns_) { log_cuda_error("cudaFree (managed)", cudaFree(base_)); }
+    base_ = other.base_;
+    cap_  = other.cap_;
+    off_  = other.off_;
+    peak_ = other.peak_;
+    owns_ = other.owns_;
+    other.base_ = nullptr;
+    other.cap_  = 0;
+    other.off_  = 0;
+    other.peak_ = 0;
+    other.owns_ = true;
+    return *this;
+}
+
+DeviceSpan ManagedDeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
+    if (base_ == nullptr) { throw std::runtime_error("ManagedDeviceArena has no backing allocation"); }
+    if (!is_power_of_two(align)) {
+        throw std::invalid_argument("arena alignment must be a nonzero power of two");
+    }
+    if (bytes == 0) { throw std::invalid_argument("arena allocation must be nonzero"); }
+
+    const std::uintptr_t base_addr           = reinterpret_cast<std::uintptr_t>(base_);
+    const std::uintptr_t current_addr        = checked_add_uintptr(base_addr, off_);
+    const std::uintptr_t aligned_addr        = align_up_addr(current_addr, align);
+    const std::uintptr_t aligned_offset_addr = aligned_addr - base_addr;
+    if (aligned_offset_addr > std::numeric_limits<std::size_t>::max()) {
+        throw std::overflow_error("arena aligned offset overflows size_t");
+    }
+    const auto aligned_offset = static_cast<std::size_t>(aligned_offset_addr);
+    if (bytes > std::numeric_limits<std::size_t>::max() - aligned_offset) {
+        throw std::overflow_error("arena allocation end offset overflows size_t");
+    }
+    const std::size_t end = aligned_offset + bytes;
+    if (end > cap_) { throw std::bad_alloc(); }
+
+    auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
+    off_      = end;
+    if (off_ > peak_) { peak_ = off_; }
+    return DeviceSpan{ptr, bytes};
+}
+
+void* ManagedDeviceArena::base() const noexcept { return base_; }
+std::size_t ManagedDeviceArena::used() const noexcept { return off_; }
+std::size_t ManagedDeviceArena::capacity() const noexcept { return cap_; }
+std::size_t ManagedDeviceArena::peak_used() const noexcept { return peak_; }
+void ManagedDeviceArena::reset() noexcept { off_ = 0; }
+void ManagedDeviceArena::reset_peak() noexcept { peak_ = off_; }
 
 } // namespace ninfer

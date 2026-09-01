@@ -88,6 +88,12 @@ struct EngineOptions {
     bool enable_prompt_cache               = false;
     std::filesystem::path prompt_cache_dir = "";          // empty resolves to default user cache dir
     std::size_t prompt_cache_max_bytes     = 30ULL << 30; // 30 GiB LRU ceiling
+    // When true, the KV cache arena is allocated with cudaMallocManaged (Unified Memory) with a
+    // GPU-preferred location, so it can oversubscribe device VRAM and transparently page to host
+    // RAM. This emulates the Windows/WDDM behavior where the large context-scaling KV buffer is
+    // not pinned to physical VRAM, at the cost of host-RAM paging bandwidth on cold KV pages.
+    // Weights and decode workspaces stay on hard cudaMalloc (resident, graph-safe).
+    bool kv_managed = false;
     bool wddm_evictable_budget             = false;       // Opt-in aggressive WDDM memory budgeting against total VRAM
     LoadProgress load_progress;
 };

@@ -59,14 +59,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
     __shared__ __align__(16) std::uint8_t Hr[S][BM * HB];
     __shared__ __align__(16) std::uint8_t Sr[S][BM * SB];
 
-    // CTA order is column-tile-major: blockIdx.x selects the token (column) tile and
-    // blockIdx.y the weight-row tile. The CTAs resident at any instant therefore span
-    // every column tile of a narrow band of weight rows, so each weight line is fetched
-    // from DRAM once and re-read from L2 by the other column tiles. Row-major order
-    // instead walks a fresh row band per column tile and re-streams the whole weight
-    // from DRAM once per column tile.
     const int tiles0 = div_up(job0.n, BM);
-    int tile         = static_cast<int>(blockIdx.y);
+    int tile         = static_cast<int>(blockIdx.x);
     RowSplitGroupedMmaJob job;
     if constexpr (Jobs == 2) {
         if (tile < tiles0) {
@@ -99,7 +93,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
     const int m0   = tile * BM;
-    const int t0   = static_cast<int>(blockIdx.x) * BN;
+    const int t0   = static_cast<int>(blockIdx.y) * BN;
 
     float acc[MT][NT][4];
 #pragma unroll
@@ -244,46 +238,41 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
 
     auto dequant_to_As = [&](int stage, int kt) {
         const int scale_off = ((kt * BK >> 6) & 1) * 2;
-        // gemm_swz64 permutes whole eight-element runs, so eight codes are the widest chunk that
-        // stays contiguous in As for every row, and with GPB == 1 the chunk lies inside the row's
-        // single quantisation group. The loop is indexed by thread over chunks, so a thread reads
-        // its own scale halfword, decodes eight codes out of one 32-bit code word and stores them
-        // with one 16-byte store instead of four 4-byte ones.
-        constexpr int kChunksPerRow = Q4RowSplitStorage::kChunksPerGroup;
-        static_assert(kChunksPerRow * 8 == BK,
-                      "a row of codes must decode to exactly the tile's k width");
-        static_assert(Q5RowSplitStorage::kChunksPerGroup == kChunksPerRow &&
-                          Q5RowSplitStorage::kHighBytesPerChunk == 1,
-                      "the Q4 and Q5 chunk shapes must agree for the mixed codec");
-        for (int item = tid; item < BM * kChunksPerRow; item += Cfg::THREADS) {
-            const int row   = item / kChunksPerRow;
-            const int chunk = item - row * kChunksPerRow;
-            const std::uint8_t* scale_ptr =
-                &Sr[stage][row * SB + (Cfg::SCALE_PAIR_LOAD ? scale_off : 0)];
-            const float scale =
-                __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
-            const unsigned word = *reinterpret_cast<const unsigned*>(
-                &Cr[stage][row * Q4RowSplitStorage::kCodeBytesPerGroup +
-                           chunk * Q4RowSplitStorage::kCodeBytesPerChunk]);
-            unsigned decoded[4];
+        for (int row = warp; row < BM; row += Cfg::WARPS) {
+            __nv_bfloat162 w;
             if constexpr (Codec == RowSplitGroupedMmaCodec::Q5) {
-                Q5MmaDecodeAtom::decode_eight(
-                    word, &Hr[stage][row * Q5RowSplitStorage::kHighBytesPerGroup + chunk], scale,
-                    decoded);
+                if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                    w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage],
+                                                     &Sr[stage][row * SB + scale_off], row, lane);
+                } else {
+                    w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage], &Sr[stage][row * SB],
+                                                     row, lane);
+                }
             } else if constexpr (Codec == RowSplitGroupedMmaCodec::Q4) {
-                Q4MmaDecodeAtom::decode_eight(word, scale, decoded);
+                if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB + scale_off],
+                                                     row, lane);
+                } else {
+                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB], row, lane);
+                }
             } else {
                 if (job.q5) {
-                    Q5MmaDecodeAtom::decode_eight(
-                        word, &Hr[stage][row * Q5RowSplitStorage::kHighBytesPerGroup + chunk],
-                        scale, decoded);
+                    if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                        w = Q5MmaDecodeAtom::decode_pair(
+                            Cr[stage], Hr[stage], &Sr[stage][row * SB + scale_off], row, lane);
+                    } else {
+                        w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage], &Sr[stage][row * SB],
+                                                         row, lane);
+                    }
+                } else if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB + scale_off],
+                                                     row, lane);
                 } else {
-                    Q4MmaDecodeAtom::decode_eight(word, scale, decoded);
+                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB], row, lane);
                 }
             }
-            store_vec(&As[row * BK + gemm_swz64(row, chunk * 8)],
-                      make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
-                                static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
+            const int sc = gemm_swz64(row, 2 * lane);
+            store_vec(&As[row * BK + sc], w);
         }
     };
 

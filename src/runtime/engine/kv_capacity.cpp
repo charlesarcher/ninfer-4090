@@ -76,7 +76,8 @@ std::uint32_t SequenceCapacityCurve::resolved_tokens(std::uint32_t main_page_gro
 
 KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                                          const SequenceCapacityCurve& curve,
-                                         std::size_t available_runtime_bytes) {
+                                         std::size_t available_runtime_bytes,
+                                         bool kv_managed) {
     validate_curve(curve);
 
     std::uint32_t pages         = curve.minimum_main_page_groups;
@@ -89,6 +90,15 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         pages = explicit_page_groups(policy, curve);
         break;
     case KvCapacityMode::Automatic:
+        if (kv_managed) {
+            // KV cache uses cudaMallocManaged and may oversubscribe device VRAM (pages to host
+            // RAM). Do not abort when the physical budget is tight; allow the full requested
+            // context and let the unified-memory allocator handle oversubscription. This mirrors
+            // the Windows/WDDM evictable-capacity inflation done in registry.cpp.
+            pages = curve.maximum_main_page_groups;
+            capacity_budget = std::max(capacity_budget, curve.reservation_bytes(pages));
+            break;
+        }
         if (available_runtime_bytes < policy.automatic_headroom_bytes) {
             throw std::invalid_argument(
                 "automatic KV headroom requires " +
