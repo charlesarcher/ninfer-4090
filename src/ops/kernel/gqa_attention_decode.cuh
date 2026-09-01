@@ -6,7 +6,6 @@
 // shared body) so each KV format can be optimized independently. This header owns
 // only what both share: layout constants, device helpers, and the split reducer.
 
-#include "core/device.h" // kTargetSmCount
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
@@ -104,12 +103,10 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_
             splits = div_up(window, 32 / Geometry::DecodeSplitScale);
         } else if (tokens == 6 && window > 128 && window <= 160) {
             splits = div_up(window, 24 / Geometry::DecodeSplitScale);
-        } else if (tokens >= 1 && tokens <= 6 && window > 4096 && window <= 8198) {
-            // Size the grid at or below one resident wave of the target device
-            // (kTargetSmCount / KVHeads) to eliminate trailing wave latency and dummy CTAs.
+        } else if (tokens == 6 && window > 5000 && window <= 8198) {
             splits             = div_up(window, 192 / Geometry::DecodeSplitScale);
             constexpr int kMin = 4 * Geometry::DecodeSplitScale;
-            constexpr int kMax = kTargetSmCount / Geometry::KVHeads;
+            constexpr int kMax = 42 * Geometry::DecodeSplitScale;
             splits             = splits > kMin ? splits : kMin;
             splits             = splits < kMax ? splits : kMax;
         } else {
@@ -199,17 +196,10 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     reduce[tid] = local_m;
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride >= 32; stride >>= 1) {
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) { reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]); }
         __syncthreads();
     }
-    float val_m = reduce[tid];
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val_m = fmaxf(val_m, __shfl_down_sync(0xffffffff, val_m, offset));
-    }
-    if (tid == 0) { reduce[0] = val_m; }
-    __syncthreads();
     const float head_m = reduce[0];
     __syncthreads();
 
@@ -235,17 +225,10 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     reduce[tid] = local_l;
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride >= 32; stride >>= 1) {
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
         __syncthreads();
     }
-    float val_l = reduce[tid];
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val_l += __shfl_down_sync(0xffffffff, val_l, offset);
-    }
-    if (tid == 0) { reduce[0] = val_l; }
-    __syncthreads();
     const float head_l = reduce[0];
 
     const int d = d_start + tid;

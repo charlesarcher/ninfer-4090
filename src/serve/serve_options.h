@@ -43,6 +43,7 @@ struct ServeOptions {
     bool enable_vision                     = false;
     std::uint32_t vision_max_tokens        = 8192;
     bool use_cuda_graph                    = true;
+    bool kv_managed                        = false; // allocate KV cache via cudaMallocManaged (oversubscribe VRAM)
     bool allow_prefix_reuse = true;
     bool enable_prompt_cache               = false;
     std::string prompt_cache_dir           = "";

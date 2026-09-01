@@ -32,8 +32,7 @@ constexpr int kDflashRotaryDim        = 128;
 constexpr int kDflashQHeads           = 32;
 constexpr int kDflashKHeads           = 8;
 constexpr int kTextChunkMaxTokens     = 1024;
-// Mirrors the production launcher: six 256-thread CTAs per SM bound the resident wave.
-constexpr int kLargeBlockCtasPerSm    = 6;
+constexpr int kLargeBlockWaveCapacity = 1020;
 constexpr float kTextTheta            = 1.0e7F;
 constexpr int kVisionHeadDim          = 72;
 constexpr int kVisionHeads            = 16;
@@ -215,7 +214,7 @@ int production_text_block(int tokens) {
     int block = 128;
     if (tokens <= 6) {
         block = (QHeads + KHeads) * 32;
-    } else if (tokens <= kLargeBlockCtasPerSm * device_sm_count()) {
+    } else if (tokens <= kLargeBlockWaveCapacity) {
         block = 256;
     } else if (tokens <= kTextChunkMaxTokens) {
         block = 192;

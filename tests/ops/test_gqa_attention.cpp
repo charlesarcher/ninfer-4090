@@ -1302,24 +1302,6 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
         }
 
-        if (dtype == DType::I8) {
-            // Sizing the INT8 split count to one resident wave between 4096 and 8198 visible keys
-            // covers tokens 1..6 (including T=1 MTP draft and T=5 speculative verification).
-            // Test both A1 and A3 routes across T=1, T=5, and T=6 in this window.
-            failures += run_a1_case(geometry, dtype, {1, 5630, 5631, 500u},
-                                    MappingPattern::Identity);
-            failures += run_a3_case(geometry, dtype, {1, 5630, 5631, 501u},
-                                    MappingPattern::Identity);
-            failures += run_a1_case(geometry, dtype, {5, 5626, 5631, 502u},
-                                    MappingPattern::Identity);
-            failures += run_a3_case(geometry, dtype, {5, 5626, 5631, 503u},
-                                    MappingPattern::Identity);
-            failures += run_a1_case(geometry, dtype, {6, 6994, 7000, 504u},
-                                    MappingPattern::Identity);
-            failures += run_a3_case(geometry, dtype, {6, 6994, 7000, 505u},
-                                    MappingPattern::Identity);
-        }
-
         if (geometry.q_heads == 16) {
             // Loose execution envelopes straddle the two registered host-resource frontiers.
             // Device positions, not these bounds, continue to define the oracle result.

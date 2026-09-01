@@ -150,54 +150,9 @@ q5_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
     }
 }
 
-// One dequant+accumulate step of the direct split2 schedule: 8 K-values of one
-// row (the lane's chunk phase) against kTt activation columns.
-//   word       : the lane's 4 packed nibble bytes
-//   high_bits  : the lane's high-plane byte (raw, pre-inversion)
-//   scale_bits : the group's fp16 scale, already broadcast across the group
-template <int kTt, int kStride>
-__device__ __forceinline__ void
-q5_split2_accumulate_chunk(std::uint32_t word, std::uint32_t high_bits, std::uint32_t scale_bits,
-                           const __nv_bfloat16* __restrict__ x, std::int64_t xoff,
-                           float (&acc)[kTt]) {
-    const std::uint32_t hc = high_bits ^ 0xffu;
-    const float scale = __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
-    const __half2 bias = __half2half2(__ushort_as_half(0x6410)); // 1040.0
-    float w[8];
-#pragma unroll
-    for (int p = 0; p < 4; ++p) {
-        std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
-        bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
-        const __half2 h = __hsub2(half2_from_bits(bits), bias);
-        const float2 f  = __half22float2(h);
-        w[p]            = f.x * scale;
-        w[p + 4]        = f.y * scale;
-    }
-#pragma unroll
-    for (int tt = 0; tt < kTt; ++tt) {
-        const uint4 xv  = load_vec<uint4>(x + static_cast<std::int64_t>(tt) * kStride + xoff);
-        const float2 f0 = bf16x2_bits_to_float2(xv.x);
-        const float2 f1 = bf16x2_bits_to_float2(xv.y);
-        const float2 f2 = bf16x2_bits_to_float2(xv.z);
-        const float2 f3 = bf16x2_bits_to_float2(xv.w);
-        acc[tt]         = fmaf(w[0], f0.x, acc[tt]);
-        acc[tt]         = fmaf(w[1], f0.y, acc[tt]);
-        acc[tt]         = fmaf(w[2], f1.x, acc[tt]);
-        acc[tt]         = fmaf(w[3], f1.y, acc[tt]);
-        acc[tt]         = fmaf(w[4], f2.x, acc[tt]);
-        acc[tt]         = fmaf(w[5], f2.y, acc[tt]);
-        acc[tt]         = fmaf(w[6], f3.x, acc[tt]);
-        acc[tt]         = fmaf(w[7], f3.y, acc[tt]);
-    }
-}
-
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
           int SplitRow = 0, bool AddResidual = false>
-// Accumulator count scales with the column tile, so the occupancy target has to as well. At 16
-// blocks ptxas is capped at 64 registers, which the wide tiles cannot hold: they spill, and the
-// spill costs more than the extra warps buy on a kernel this bandwidth-bound. Narrow tiles fit
-// inside 64 and prefer the warps.
-__launch_bounds__(64, (kTt <= 3 || (kStride <= 6144 && kTt <= 6)) ? 16 : 8) __global__
+__launch_bounds__(64, 16) __global__
     void q5_rowsplit_gemm_simt_split2_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
                                              const std::uint8_t* __restrict__ high,
@@ -230,107 +185,55 @@ __launch_bounds__(64, (kTt <= 3 || (kStride <= 6144 && kTt <= 6)) ? 16 : 8) __gl
 #pragma unroll
     for (int i = 0; i < kTt; ++i) { acc[i] = 0.0f; }
 
-    // Slab schedule.
-    //
-    // kFullSlabs is a compile-time constant, so nvcc fully unrolls the K sweep
-    // by default. At K=17408 (kFullSlabs=17, kTt=5) that is ~4100 SASS
-    // instructions = 64 KB of code executed exactly once per block, which
-    // overruns the SM instruction cache and costs real bandwidth. Rolling the
-    // loop back up shrinks the body to ~10 KB, but ptxas does not
-    // software-pipeline the global loads across the back edge under -rdc=true
-    // (which this project builds with), so a naive rolled loop stalls on DRAM
-    // latency and is *slower* than the unrolled form. Issuing slab s+1's three
-    // weight-plane loads by hand, into registers, before consuming slab s
-    // restores the memory-level parallelism explicitly, so both properties hold
-    // at once.
-    //
-    // This only pays when the K sweep is long enough to overrun the instruction
-    // cache and the column tile is wide enough that the rolled schedule still
-    // saturates DRAM; on the short K=6144 sweep the extra live registers spill
-    // instead. Measured on RTX 4090 / sm_89, 5120xK Q5 linear_add, cold L2,
-    // repo build flags (-rdc=true, -lineinfo), median of 25-60 launches, us:
-    //
-    //   K=17408   kTt=2  kTt=3  kTt=4  kTt=5  kTt=8  kTt=12  kTt=14  kTt=16
-    //   unrolled   91.0   92.7  100.2  107.5  128.1   192.9   219.1   234.5
-    //   rolled     90.8   93.2   98.3  100.5  132.8   167.9   183.3   207.9
-    //
-    // so the rolled schedule is gated to kFullSlabs > 8 && kTt >= 4; every other
-    // instantiation keeps the fully unrolled body unchanged. Deeper prefetch
-    // (2-3 slabs) and unroll factors 1/3/4/5 all measured slower. Results are
-    // bit-identical either way: the accumulation order does not change.
-    //
-    // The table above was taken under the previous fixed occupancy target, which
-    // capped this kernel at 64 registers. The launch bound is now a function of
-    // the column tile, so the wide tiles get 128, and the rolled body's manual
-    // prefetch no longer spills. The gate was re-verified against the new bound
-    // and still holds, but two rows moved: kTt=8 now favours rolled (116.9 vs
-    // 125.9 unrolled) where the table has it losing, and kTt=12/16 are close to
-    // a tie rather than a clear rolled win. kTt=3 still prefers unrolled
-    // (94.3 vs 101.8), which is what keeps the threshold at 4.
-    constexpr bool kRollSlabs = kFullSlabs > 8 && kTt >= 4;
-
-    if constexpr (kRollSlabs) {
-        // Lane-invariant slice bases; a slab is a fixed stride off each.
-        const std::uint8_t* code_base  = code_row + part * 256 + lane * 4;
-        const std::uint8_t* high_base  = high_row + part * 64 + lane;
-        const std::uint8_t* scale_base = scale_row + part * 16 + (lane >> 3) * 2;
-
-        std::uint32_t next_word[2];
-        std::uint32_t next_high[2];
-        std::uint32_t next_scale[2];
-        const auto issue_slab = [&](int s) {
 #pragma unroll
-            for (int local = 0; local < 2; ++local) {
-                next_word[local] = *reinterpret_cast<const std::uint32_t*>(
-                    code_base + static_cast<std::int64_t>(s) * 512 + local * 128);
-                next_high[local] = *(high_base + static_cast<std::int64_t>(s) * 128 + local * 32);
-                next_scale[local] = *reinterpret_cast<const std::uint16_t*>(
-                    scale_base + static_cast<std::int64_t>(s) * 32 + local * 8);
+    for (int s = 0; s < kFullSlabs; ++s) {
+#pragma unroll
+        for (int local = 0; local < 2; ++local) {
+            const int chunk = part * 2 + local;
+            const std::uint8_t* code_phase =
+                code_row + static_cast<std::int64_t>(s) * 512 + chunk * 128 + lane * 4;
+            const std::uint8_t* high_phase =
+                high_row + static_cast<std::int64_t>(s) * 128 + chunk * 32 + lane;
+            const int group_in_slab  = chunk * 4 + (lane >> 3);
+            std::uint32_t scale_bits = 0;
+            if ((lane & 7) == 0) {
+                scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                    scale_row + (static_cast<std::int64_t>(s) * 16 + group_in_slab) * 2);
             }
-        };
-        issue_slab(0);
+            scale_bits = __shfl_sync(0xffffffffu, scale_bits, lane & ~7);
 
-#pragma unroll 2
-        for (int s = 0; s < kFullSlabs; ++s) {
-            std::uint32_t word[2];
-            std::uint32_t high_bits[2];
-            std::uint32_t scale_bits[2];
+            const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(code_phase);
+            const std::uint32_t hc   = static_cast<std::uint32_t>(*high_phase) ^ 0xffu;
+            const float scale        = __half2float(__ushort_as_half(scale_bits));
+            const __half2 bias       = __half2half2(__ushort_as_half(0x6410)); // 1040.0
+            float w[8];
 #pragma unroll
-            for (int local = 0; local < 2; ++local) {
-                word[local]       = next_word[local];
-                high_bits[local]  = next_high[local];
-                scale_bits[local] = next_scale[local];
+            for (int p = 0; p < 4; ++p) {
+                std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
+                bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
+                const __half2 h = __hsub2(half2_from_bits(bits), bias);
+                const float2 f  = __half22float2(h);
+                w[p]            = f.x * scale;
+                w[p + 4]        = f.y * scale;
             }
-            if (s + 1 < kFullSlabs) { issue_slab(s + 1); }
+
+            const std::int64_t xoff = static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
 #pragma unroll
-            for (int local = 0; local < 2; ++local) {
-                const int chunk = part * 2 + local;
-                q5_split2_accumulate_chunk<kTt, kStride>(
-                    word[local], high_bits[local], scale_bits[local], x,
-                    static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8, acc);
-            }
-        }
-    } else {
-#pragma unroll
-        for (int s = 0; s < kFullSlabs; ++s) {
-#pragma unroll
-            for (int local = 0; local < 2; ++local) {
-                const int chunk = part * 2 + local;
-                const std::uint8_t* code_phase =
-                    code_row + static_cast<std::int64_t>(s) * 512 + chunk * 128 + lane * 4;
-                const std::uint8_t* high_phase =
-                    high_row + static_cast<std::int64_t>(s) * 128 + chunk * 32 + lane;
-                const int group_in_slab  = chunk * 4 + (lane >> 3);
-                std::uint32_t scale_bits = 0;
-                if ((lane & 7) == 0) {
-                    scale_bits = *reinterpret_cast<const std::uint16_t*>(
-                        scale_row + (static_cast<std::int64_t>(s) * 16 + group_in_slab) * 2);
-                }
-                scale_bits = __shfl_sync(0xffffffffu, scale_bits, lane & ~7);
-                q5_split2_accumulate_chunk<kTt, kStride>(
-                    *reinterpret_cast<const std::uint32_t*>(code_phase),
-                    static_cast<std::uint32_t>(*high_phase), scale_bits, x,
-                    static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8, acc);
+            for (int tt = 0; tt < kTt; ++tt) {
+                const uint4 xv =
+                    load_vec<uint4>(x + static_cast<std::int64_t>(tt) * kStride + xoff);
+                const float2 f0 = bf16x2_bits_to_float2(xv.x);
+                const float2 f1 = bf16x2_bits_to_float2(xv.y);
+                const float2 f2 = bf16x2_bits_to_float2(xv.z);
+                const float2 f3 = bf16x2_bits_to_float2(xv.w);
+                acc[tt]         = fmaf(w[0], f0.x, acc[tt]);
+                acc[tt]         = fmaf(w[1], f0.y, acc[tt]);
+                acc[tt]         = fmaf(w[2], f1.x, acc[tt]);
+                acc[tt]         = fmaf(w[3], f1.y, acc[tt]);
+                acc[tt]         = fmaf(w[4], f2.x, acc[tt]);
+                acc[tt]         = fmaf(w[5], f2.y, acc[tt]);
+                acc[tt]         = fmaf(w[6], f3.x, acc[tt]);
+                acc[tt]         = fmaf(w[7], f3.y, acc[tt]);
             }
         }
     }
@@ -352,178 +255,6 @@ __launch_bounds__(64, (kTt <= 3 || (kStride <= 6144 && kTt <= 6)) ? 16 : 8) __gl
             out[index] = __hadd(sum_bf16, out[index]);
         } else {
             out[index] = sum_bf16;
-        }
-    }
-}
-
-// Multi-row split2. The single-row kernel widens every bf16 activation to fp32 immediately before
-// its FFMA, because each activation value feeds exactly one weight: SASS shows one PRMT per FFMA,
-// 26% of the kernel's instructions. Giving a CTA kRows output rows lets one widened activation feed
-// kRows FFMAs, so the conversion and the activation load are both amortised kRows-fold. Everything
-// else - the dequant, the accumulate order, the reduction - is unchanged, so results stay
-// bit-identical to the single-row kernel row for row.
-template <int kRows, int kTt, int kStride>
-__device__ __forceinline__ void
-q5_split2_accumulate_chunk_rows(const std::uint32_t (&word)[kRows],
-                                const std::uint32_t (&high_bits)[kRows],
-                                const std::uint32_t (&scale_bits)[kRows],
-                                const __nv_bfloat16* __restrict__ x, std::int64_t xoff,
-                                float (&acc)[kRows][kTt]) {
-    const __half2 bias = __half2half2(__ushort_as_half(0x6410)); // 1040.0
-    float w[kRows][8];
-#pragma unroll
-    for (int r = 0; r < kRows; ++r) {
-        const std::uint32_t hc = high_bits[r] ^ 0xffu;
-        const float scale =
-            __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits[r])));
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            std::uint32_t bits = ((word[r] >> (4 * p)) & 0x000f000fu) | 0x64006400u;
-            bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
-            const __half2 h = __hsub2(half2_from_bits(bits), bias);
-            const float2 f  = __half22float2(h);
-            w[r][p]         = f.x * scale;
-            w[r][p + 4]     = f.y * scale;
-        }
-    }
-#pragma unroll
-    for (int tt = 0; tt < kTt; ++tt) {
-        const uint4 xv  = load_vec<uint4>(x + static_cast<std::int64_t>(tt) * kStride + xoff);
-        const float2 f0 = bf16x2_bits_to_float2(xv.x);
-        const float2 f1 = bf16x2_bits_to_float2(xv.y);
-        const float2 f2 = bf16x2_bits_to_float2(xv.z);
-        const float2 f3 = bf16x2_bits_to_float2(xv.w);
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-            acc[r][tt] = fmaf(w[r][0], f0.x, acc[r][tt]);
-            acc[r][tt] = fmaf(w[r][1], f0.y, acc[r][tt]);
-            acc[r][tt] = fmaf(w[r][2], f1.x, acc[r][tt]);
-            acc[r][tt] = fmaf(w[r][3], f1.y, acc[r][tt]);
-            acc[r][tt] = fmaf(w[r][4], f2.x, acc[r][tt]);
-            acc[r][tt] = fmaf(w[r][5], f2.y, acc[r][tt]);
-            acc[r][tt] = fmaf(w[r][6], f3.x, acc[r][tt]);
-            acc[r][tt] = fmaf(w[r][7], f3.y, acc[r][tt]);
-        }
-    }
-}
-
-template <class SC, int kRows, int kTt, int kFullSlabs, int kStride, bool AddResidual = false>
-__launch_bounds__(64, 8) __global__
-    void q5_rowsplit_gemm_simt_split2_rows_kernel(const __nv_bfloat16* __restrict__ x,
-                                                  const std::uint8_t* __restrict__ codes,
-                                                  const std::uint8_t* __restrict__ high,
-                                                  const std::uint8_t* __restrict__ scales,
-                                                  __nv_bfloat16* __restrict__ out, std::int32_t n,
-                                                  std::int32_t k, std::int32_t t,
-                                                  std::int32_t padded_k, std::int32_t full_slabs) {
-    static_assert(std::is_same_v<SC, Q5RowSplitSimtSchedule>, "multi-row split2 is Q5-only");
-    static_assert(kRows >= 2, "multi-row split2 needs at least two rows");
-    (void)full_slabs;
-    (void)k;
-    (void)t;
-
-    __shared__ float s_part[2][kRows][kTt];
-
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int part = static_cast<int>(threadIdx.x) >> 5;
-    const int row0 = static_cast<int>(blockIdx.x) * kRows;
-    if (row0 >= n) { return; }
-    const int rows_here = min(kRows, n - row0);
-
-    const int kg_padded = padded_k / Q5RowSplitStorage::kGroupK;
-
-    float acc[kRows][kTt];
-#pragma unroll
-    for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-        for (int i = 0; i < kTt; ++i) { acc[r][i] = 0.0f; }
-    }
-
-    const std::uint8_t* code_base[kRows];
-    const std::uint8_t* high_base[kRows];
-    const std::uint8_t* scale_base[kRows];
-#pragma unroll
-    for (int r = 0; r < kRows; ++r) {
-        const std::int64_t rr = row0 + (r < rows_here ? r : 0);
-        code_base[r]  = codes + rr * kg_padded * 32 + part * 256 + lane * 4;
-        high_base[r]  = high + rr * kg_padded * SC::kHighBytesPerGroup + part * 64 + lane;
-        scale_base[r] = scales + rr * kg_padded * 2 + part * 16 + (lane >> 3) * 2;
-    }
-
-    std::uint32_t next_word[kRows][2];
-    std::uint32_t next_high[kRows][2];
-    std::uint32_t next_scale[kRows][2];
-    const auto issue_slab = [&](int sl) {
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-            for (int local = 0; local < 2; ++local) {
-                next_word[r][local] = *reinterpret_cast<const std::uint32_t*>(
-                    code_base[r] + static_cast<std::int64_t>(sl) * 512 + local * 128);
-                next_high[r][local] =
-                    *(high_base[r] + static_cast<std::int64_t>(sl) * 128 + local * 32);
-                next_scale[r][local] = *reinterpret_cast<const std::uint16_t*>(
-                    scale_base[r] + static_cast<std::int64_t>(sl) * 32 + local * 8);
-            }
-        }
-    };
-    issue_slab(0);
-
-#pragma unroll 1
-    for (int sl = 0; sl < kFullSlabs; ++sl) {
-        std::uint32_t word[kRows][2];
-        std::uint32_t high_bits[kRows][2];
-        std::uint32_t scale_bits[kRows][2];
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-            for (int local = 0; local < 2; ++local) {
-                word[r][local]       = next_word[r][local];
-                high_bits[r][local]  = next_high[r][local];
-                scale_bits[r][local] = next_scale[r][local];
-            }
-        }
-        if (sl + 1 < kFullSlabs) { issue_slab(sl + 1); }
-#pragma unroll
-        for (int local = 0; local < 2; ++local) {
-            const int chunk = part * 2 + local;
-            std::uint32_t cw[kRows];
-            std::uint32_t ch[kRows];
-            std::uint32_t cs[kRows];
-#pragma unroll
-            for (int r = 0; r < kRows; ++r) {
-                cw[r] = word[r][local];
-                ch[r] = high_bits[r][local];
-                cs[r] = scale_bits[r][local];
-            }
-            q5_split2_accumulate_chunk_rows<kRows, kTt, kStride>(
-                cw, ch, cs, x, static_cast<std::int64_t>(sl) * 1024 + chunk * 256 + lane * 8, acc);
-        }
-    }
-
-#pragma unroll
-    for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-        for (int tt = 0; tt < kTt; ++tt) {
-            float a = warp_reduce_sum(acc[r][tt]);
-            if (lane == 0) { s_part[part][r][tt] = a; }
-        }
-    }
-
-    __syncthreads();
-
-    if (part == 0 && lane < kTt * kRows) {
-        const int r  = lane / kTt;
-        const int tt = lane - r * kTt;
-        if (r < rows_here) {
-            const std::int64_t index     = static_cast<std::int64_t>(tt) * n + row0 + r;
-            const float sum              = s_part[0][r][tt] + s_part[1][r][tt];
-            const __nv_bfloat16 sum_bf16 = __float2bfloat16_rn(sum);
-            if constexpr (AddResidual) {
-                out[index] = __hadd(sum_bf16, out[index]);
-            } else {
-                out[index] = sum_bf16;
-            }
         }
     }
 }
@@ -554,9 +285,7 @@ struct Q5Split4StoreEpilogue {
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
           int SplitRow = 0, class Epilogue = Q5Split4StoreEpilogue, bool TriggerPdl = false,
           bool JoinPdl = false>
-// Same trade as the split2 bound above: the wide column tiles need more registers than a 10-block
-// target leaves them, and the spill costs more than the extra warps return.
-__launch_bounds__(128, kTt <= 5 ? 10 : 8) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
+__launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ out_tail, std::int32_t n,
@@ -679,122 +408,6 @@ __launch_bounds__(128, kTt <= 5 ? 10 : 8) __global__ void q5_rowsplit_gemm_simt_
         }
     }
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
-}
-
-// Multi-row split4. Same trade as the split2 variant above: one widened activation feeds kRows
-// FFMAs instead of one, so the bf16->fp32 PRMT that SASS shows paired 1:1 with every FFMA amortises
-// kRows-fold. The four-way K split, the dequant and the accumulate order are unchanged, so each row
-// produces bit-identical results to the single-row kernel. The split-output seam is evaluated per
-// row, so a CTA whose rows straddle it still writes each row to the correct destination.
-template <class SC, int kRows, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
-          int SplitRow = 0, class Epilogue = Q5Split4StoreEpilogue>
-__launch_bounds__(128, kTt >= 8 ? 6 : 8) __global__ void q5_rowsplit_gemm_simt_split4_rows_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ out_tail, std::int32_t n,
-    std::int32_t out_ld, std::int32_t k, std::int32_t t, std::int32_t padded_k,
-    std::int32_t full_slabs, Epilogue epilogue = {}) {
-    static_assert(std::is_same_v<SC, Q5RowSplitSimtSchedule>, "multi-row split4 is Q5-only");
-    static_assert(kRows >= 2, "multi-row split4 needs at least two rows");
-    (void)full_slabs;
-    (void)k;
-    (void)t;
-
-    __shared__ float s_part[4][kRows][kTt];
-
-    const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const int chunk = static_cast<int>(threadIdx.x) >> 5;
-    const int row0  = static_cast<int>(blockIdx.x) * kRows;
-    if (row0 >= n) { return; }
-    const int rows_here = min(kRows, n - row0);
-
-    const int kg_padded = padded_k / Q5RowSplitStorage::kGroupK;
-
-    float acc[kRows][kTt];
-#pragma unroll
-    for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-        for (int i = 0; i < kTt; ++i) { acc[r][i] = 0.0f; }
-    }
-
-#pragma unroll
-    for (int s = 0; s < kFullSlabs; ++s) {
-        const int group_in_slab = chunk * 4 + (lane >> 3);
-        std::uint32_t word[kRows];
-        std::uint32_t high_bits[kRows];
-        std::uint32_t scale_bits[kRows];
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-            const std::int64_t rr = row0 + (r < rows_here ? r : 0);
-            const std::uint8_t* code_row = codes + rr * kg_padded * 32;
-            const std::uint8_t* high_row =
-                high + rr * kg_padded * Q5RowSplitSimtSchedule::kHighBytesPerGroup;
-            const std::uint8_t* scale_row = scales + rr * kg_padded * 2;
-            word[r] = *reinterpret_cast<const std::uint32_t*>(
-                code_row + static_cast<std::int64_t>(s) * 512 + chunk * 128 + lane * 4);
-            high_bits[r] = static_cast<std::uint32_t>(
-                *(high_row + static_cast<std::int64_t>(s) * 128 + chunk * 32 + lane));
-            std::uint32_t sb = 0;
-            if ((lane & 7) == 0) {
-                sb = *reinterpret_cast<const std::uint16_t*>(
-                    scale_row + (static_cast<std::int64_t>(s) * 16 + group_in_slab) * 2);
-            }
-            scale_bits[r] = __shfl_sync(0xffffffffu, sb, lane & ~7);
-        }
-        q5_split2_accumulate_chunk_rows<kRows, kTt, kStride>(
-            word, high_bits, scale_bits, x,
-            static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8, acc);
-    }
-
-#pragma unroll
-    for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-        for (int tt = 0; tt < kTt; ++tt) {
-            float a = warp_reduce_sum(acc[r][tt]);
-            if (lane == 0) { s_part[chunk][r][tt] = a; }
-        }
-    }
-
-    __syncthreads();
-
-    if constexpr (std::is_same_v<Epilogue, Q5Split4StoreEpilogue>) {
-        if (chunk == 0 && lane < kTt * kRows) {
-            const int r  = lane / kTt;
-            const int tt = lane - r * kTt;
-            if (r < rows_here) {
-                float sum = 0.0f;
-#pragma unroll
-                for (int p = 0; p < 4; ++p) { sum += s_part[p][r][tt]; }
-                const int row = row0 + r;
-                if constexpr (SplitOutput) {
-                    if (row < SplitRow) {
-                        out[static_cast<std::int64_t>(tt) * out_ld + row] = __float2bfloat16(sum);
-                    } else {
-                        out_tail[static_cast<std::int64_t>(tt) * (n - SplitRow) + row - SplitRow] =
-                            __float2bfloat16(sum);
-                    }
-                } else {
-                    out[static_cast<std::int64_t>(tt) * out_ld + row] = __float2bfloat16(sum);
-                }
-            }
-        }
-    } else {
-        if (chunk == 0 && lane < kTt * kRows) {
-            const int r  = lane / kTt;
-            const int tt = lane - r * kTt;
-            float sum    = 0.0f;
-#pragma unroll
-            for (int p = 0; p < 4; ++p) { sum += s_part[p][r][tt]; }
-            s_part[0][r][tt] = sum;
-        }
-        __syncthreads();
-        if (chunk == 0 && lane < kRows) {
-            if (lane < rows_here) {
-                epilogue.template operator()<SplitOutput, SplitRow>(out, out_tail, n, out_ld,
-                                                                    row0 + lane, s_part[0][lane]);
-            }
-        }
-    }
 }
 
 // full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte
