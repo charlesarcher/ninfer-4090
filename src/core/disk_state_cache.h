@@ -126,7 +126,7 @@ public:
     // to enqueue_save_cow, and do not let it outlive the cache.
     class PageLease {
     public:
-        PageLease() = default;
+        PageLease() : owner_(nullptr) {}
         PageLease(PageLease&& other) noexcept;
         PageLease& operator=(PageLease&& other) noexcept;
         PageLease(const PageLease&)            = delete;
@@ -140,7 +140,7 @@ public:
         friend class DiskStateCache::Impl;
         void release() noexcept;
 
-        Impl* owner_ = nullptr;
+        Impl* owner_;
         std::vector<std::uint64_t> hashes_;
         std::vector<bool> stored_;
     };

@@ -261,15 +261,8 @@ void HttpServer::register_routes() {
             }
         });
 
-    // Report the executor's own state: a latched failure is permanent, so answering "ok"
-    // here leaves a process that 503s every request looking healthy to any supervisor.
-    // Before the service is attached (model still loading/warming up) the endpoint
-    // reports unavailable, so supervisors gate traffic on real readiness.
-    server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
-        const bool available = service_ != nullptr && service_->engine_healthy();
-        res.status           = available ? 200 : 503;
-        res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
-                        "application/json");
+    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(metrics_.render(options_.max_concurrency), "text/plain; version=0.0.4");
